@@ -46,19 +46,6 @@ copy .env.example .env   # fill in TYPESAFE_API_KEY and GOOGLE_API_KEY
 .\.venv\Scripts\python main.py
 ```
 
-## Why split the work this way
-
-Jev is designed to be ~40-200x faster and far cheaper than a frontier
-LLM for exactly this kind of structured decision. That advantage only
-shows up when the classifier's signals let the pipeline *skip*
-resolver LLM work, not just run alongside it — both workflows use
-`should_early_exit()` to auto-resolve low-stakes tickets (low urgency,
-no refund intent, confident routing) without ever calling the resolver
-LLM, and only fall through to it for tickets that actually need
-judgment. Keeping the resolver stage identical in both workflows
-isolates the comparison to the one thing that actually differs: the
-classifier engine.
-
 ## Benchmark
 
 `benchmark.py` runs the same 10 sample tickets through both workflows
