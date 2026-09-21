@@ -1,4 +1,4 @@
-"""Demo runner: a few sample tickets through the Jev + LangChain triage agent."""
+"""Demo runner: one sample ticket through the Jev + LLM triage workflow."""
 
 from __future__ import annotations
 
@@ -8,32 +8,25 @@ from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_typesafe import TypeSafeClassifier
 
-from triage_agent import handle_ticket
+from triage_agent import handle_ticket_jev_classifier
 
 load_dotenv()
 
-SAMPLE_TICKETS = [
-    "My order ORD-1001 arrived broken and I want my money back, this is ridiculous.",
-    "Hi, I can't log into my account, it keeps saying my password is wrong even after I reset it.",
-    "Quick question: does the Pro subscription (ORD-1002) include priority email support?",
-]
+SAMPLE_TICKET = "My order ORD-1001 arrived broken and I want my money back, this is ridiculous."
 
 
 def main() -> None:
     jev = TypeSafeClassifier()  # reads TYPESAFE_API_KEY from the environment
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)  # reads GOOGLE_API_KEY
 
-    for message in SAMPLE_TICKETS:
-        print("=" * 80)
-        print("TICKET:", message)
-        result = handle_ticket(message, jev=jev, llm=llm)
+    print("TICKET:", SAMPLE_TICKET)
+    result = handle_ticket_jev_classifier(SAMPLE_TICKET, jev=jev, llm=llm)
 
-        print("\nJev signals (~%.0fms):" % result["jev_signals"]["jev_latency_ms"])
-        print(json.dumps(result["jev_signals"], indent=2))
+    print("\nJev signals (~%.0fms):" % result["classifier_signals"]["latency_ms"])
+    print(json.dumps(result["classifier_signals"], indent=2))
 
-        print("\nAgent resolution:")
-        print(result["agent_reply"])
-        print()
+    print("\nResolution%s:" % (" (early-exit, no resolver LLM call)" if result["early_exit"] else ""))
+    print(result["agent_reply"])
 
 
 if __name__ == "__main__":
