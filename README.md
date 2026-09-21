@@ -72,8 +72,7 @@ the gap isn't about accuracy — it's that a general-purpose LLM call
 pays for its own reasoning/"thinking" tokens even on a simple
 classification task (observed ~300+ output tokens per classification
 call), while Jev returns a typed, calibrated answer with no generated
-text at all. That gap compounds on every ticket that reaches the
-resolver stage, and disappears on none.
+text at all.
 
 This is a live network benchmark, not a controlled one: provider load,
 network variance, and model non-determinism all affect single-run
