@@ -6,8 +6,8 @@ import json
 
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_typesafe import TypeSafeClassifier
 
-from jev_client import JevClient
 from triage_agent import handle_ticket
 
 load_dotenv()
@@ -20,7 +20,7 @@ SAMPLE_TICKETS = [
 
 
 def main() -> None:
-    jev = JevClient()  # reads TYPESAFE_API_KEY from the environment
+    jev = TypeSafeClassifier()  # reads TYPESAFE_API_KEY from the environment
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)  # reads GOOGLE_API_KEY
 
     for message in SAMPLE_TICKETS:

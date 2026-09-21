@@ -5,13 +5,10 @@ Use case: an agentic support-ticket triage pipeline that combines
 instead of generated text) with a **LangChain** ReAct agent (Gemini 2.5
 Flash) for the actual reasoning and tool use.
 
-- `jev_client.py` — small HTTP client for Jev's `/v1/systemone` endpoint,
-  covering all three question types: `Noul` (yes/no probability),
-  `Score` (position on an ordered rubric), `Choice` (pick one of N
-  labeled options).
-- `triage_agent.py` — the pipeline: Jev classifies each ticket
-  (department via `Choice`, urgency via `Score`, refund intent via
-  `Noul`), then a LangChain agent uses those signals plus tools
+- `triage_agent.py` — the pipeline: Jev classifies each ticket via the
+  official `langchain_typesafe` package (`TypeSafeClassifier` +
+  `Noul`/`Score`/`Choice`, department via `Choice`, urgency via `Score`,
+  refund intent via `Noul`), then a LangChain agent uses those signals plus tools
   (`lookup_order`, `create_support_ticket`, `issue_refund`) to resolve
   it. `issue_refund` is gated on Jev's own refund-probability signal, so
   the fast model acts as a safety guardrail on the LLM agent, not just

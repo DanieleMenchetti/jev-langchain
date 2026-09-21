@@ -1,5 +1,8 @@
 """Agentic AI use case: support-ticket triage with Jev + LangChain.
 
+Uses the official `langchain_typesafe` integration (`TypeSafeClassifier`,
+`Noul`, `Score`, `Choice`) instead of a hand-rolled HTTP client.
+
 Architecture
 ------------
 Every incoming ticket goes through two stages:
@@ -27,14 +30,14 @@ front, LLM reasoning only where it's actually needed.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import SystemMessage
 from langchain_core.tools import tool
+from langchain_typesafe import Choice, Noul, Score, TypeSafeClassifier
 from langgraph.prebuilt import create_react_agent
-
-from jev_client import Choice, JevClient, Noul, Score
 
 # --------------------------------------------------------------------------
 # Stage 1: Jev triage
@@ -55,38 +58,43 @@ URGENCY_LEVELS = [
 ]
 
 
-def jev_triage(client: JevClient, message: str) -> Dict[str, Any]:
+def jev_triage(classifier: TypeSafeClassifier, message: str) -> Dict[str, Any]:
     """Run the three Jev question types against a raw ticket message."""
-    answers = client.ask(
-        state=message,
-        questions={
-            "department": Choice(
-                instructions="Which team should handle this customer message?",
-                criteria=DEPARTMENTS,
-            ),
-            "urgency": Score(
-                instructions="How urgent is this customer message?",
-                criteria=URGENCY_LEVELS,
-            ),
-            "wants_refund": Noul(
-                instructions="Is the customer explicitly asking for a refund or their money back?",
-            ),
-        },
+    started = time.monotonic()
+    response = classifier.invoke(
+        {
+            "state": message,
+            "questions": {
+                "department": Choice(
+                    instructions="Which team should handle this customer message?",
+                    criteria=DEPARTMENTS,
+                ),
+                "urgency": Score(
+                    instructions="How urgent is this customer message?",
+                    criteria=URGENCY_LEVELS,
+                ),
+                "wants_refund": Noul(
+                    instructions="Is the customer explicitly asking for a refund or their money back?",
+                ),
+            },
+        }
     )
+    latency_ms = (time.monotonic() - started) * 1000
 
-    department = answers["department"]
-    urgency = answers["urgency"]
-    wants_refund = answers["wants_refund"]
+    department = response.choices["department"]
+    urgency = response.scores["urgency"]
+    wants_refund = response.nouls["wants_refund"]
+    urgency_level = round(min(max(urgency.score, 0), len(URGENCY_LEVELS) - 1))
 
     return {
         "department": department.choice,
         "department_confidence": department.confidence,
         "urgency_score": urgency.score,
-        "urgency_label": URGENCY_LEVELS[round(min(max(urgency.score, 0), len(URGENCY_LEVELS) - 1))],
+        "urgency_label": URGENCY_LEVELS[urgency_level],
         "urgency_confidence": urgency.confidence,
         "refund_probability": wants_refund.noul,
-        "likely_refund_request": wants_refund.is_yes,
-        "jev_latency_ms": client.last_latency_ms,
+        "likely_refund_request": wants_refund.noul >= 0.5,
+        "jev_latency_ms": latency_ms,
     }
 
 
@@ -161,7 +169,7 @@ support ticket or issue a refund as appropriate. Be concise.
 """
 
 
-def handle_ticket(message: str, jev: JevClient, llm: BaseChatModel) -> Dict[str, Any]:
+def handle_ticket(message: str, jev: TypeSafeClassifier, llm: BaseChatModel) -> Dict[str, Any]:
     """Run the full triage -> agent pipeline for one incoming ticket."""
     signals = jev_triage(jev, message)
 
@@ -176,6 +184,19 @@ def handle_ticket(message: str, jev: JevClient, llm: BaseChatModel) -> Dict[str,
             ]
         }
     )
-    final_reply = result["messages"][-1].content
+    return {"jev_signals": signals, "agent_reply": _as_text(result["messages"][-1].content)}
 
-    return {"jev_signals": signals, "agent_reply": final_reply}
+
+def _as_text(content: Any) -> str:
+    """Flatten a message's content into plain text.
+
+    Some providers (e.g. Gemini) return content as a list of blocks
+    (text, thought signatures, ...) instead of a plain string.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return str(content)
