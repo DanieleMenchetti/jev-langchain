@@ -5,16 +5,21 @@ Uses the official `langchain_typesafe` integration (`TypeSafeClassifier`,
 
 Architecture
 ------------
-Both workflows share the exact same two-stage shape, so the only thing
-that differs between them is *which engine does the classifying*:
+Both workflows share the exact same shape, so the only thing that
+differs between them is *which engine does the classifying*:
 
     request -> [classifier] -> early exit? -> auto-file
-                             -> otherwise   -> [resolver LLM + tools] -> reply
+                             -> otherwise   -> [department router]
+                                               -> billing agent
+                                               -> technical agent
+                                               -> account agent
+                                               -> other agent
+                                            -> reply
 
 1. Classifier stage - answers the same three questions about the raw
    message (department, urgency, refund intent) and, from those
    signals, decides whether the ticket is safe to auto-resolve without
-   ever reaching the resolver LLM:
+   ever reaching a resolver agent:
      - `jev_triage()` - one Jev call (`Choice` + `Score` + `Noul`).
      - `llm_triage()` - one Gemini call with structured output, asked
        to answer the same three questions on the same rubric.
@@ -22,20 +27,23 @@ that differs between them is *which engine does the classifying*:
    threshold function decides the early exit either way.
 
 2. Resolver stage (only reached when the classifier doesn't early-exit)
-   - a LangChain ReAct agent (Gemini 2.5 Flash) reads the classifier's
-   signals plus the ticket text and calls tools (look up the order,
-   file a ticket, issue a refund) to produce a final resolution.
-   `issue_refund` is gated on the classifier's own refund-probability
-   signal, independent of whatever the resolver LLM decides mid-conversation.
+   - the classified `department` picks one of four specialized
+   LangChain ReAct agents (Gemini 2.5 Flash), each with its own role
+   framing and toolset (see `DEPARTMENT_AGENTS`). Every resolver agent
+   still reads the classifier's signals plus the ticket text.
+   `issue_refund` (billing only) is gated on the classifier's own
+   refund-probability signal, independent of whatever the resolver
+   agent decides mid-conversation.
 
 Two workflows are exposed for comparison (see `benchmark.py`):
 - `handle_ticket_llm_classifier` -- "only LLM": an LLM call classifies
-  and can early-exit; otherwise the resolver LLM handles it.
+  and can early-exit; otherwise the matching department agent handles it.
 - `handle_ticket_jev_classifier` -- "Jev + LLM": Jev classifies and can
-  early-exit; otherwise the same resolver LLM handles it.
+  early-exit; otherwise the same department agents handle it.
 
-Because the resolver stage is identical in both workflows, any latency
-or cost difference between them comes entirely from the classifier.
+Because the resolver stage (department agents, tools, thresholds) is
+identical in both workflows, any latency or cost difference between
+them comes entirely from the classifier.
 """
 
 from __future__ import annotations
@@ -202,7 +210,7 @@ def llm_triage(llm: BaseChatModel, message: str) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Resolver stage: shared by both workflows
+# Resolver stage: one specialized agent per department, shared by both workflows
 # --------------------------------------------------------------------------
 
 # Toy in-memory "order database" for the demo.
@@ -212,18 +220,7 @@ _ORDERS = {
 }
 
 
-def build_tools(signals: Dict[str, Any]):
-    """Build the resolver agent's toolset, closing over this ticket's
-    classifier signals.
-
-    `issue_refund` is deliberately gated on the classifier's own
-    `refund_probability` signal: even if the resolver LLM decides to
-    call it, the tool refuses unless the classifier's independent read
-    of the message actually supports a refund intent above a safety
-    threshold. This is the "classifier guards resolver" pattern, and it
-    applies identically whether the classifier was Jev or an LLM.
-    """
-
+def _lookup_order_tool():
     @tool
     def lookup_order(order_id: str) -> str:
         """Look up an order by its ID and return its item, amount and status."""
@@ -232,6 +229,10 @@ def build_tools(signals: Dict[str, Any]):
             return f"No order found with id {order_id}"
         return f"{order_id}: {order['item']}, ${order['amount']:.2f}, status={order['status']}"
 
+    return lookup_order
+
+
+def _create_ticket_tool(signals: Dict[str, Any]):
     @tool
     def create_support_ticket(summary: str) -> str:
         """File a support ticket for a human agent, tagged with the department/urgency already classified."""
@@ -239,6 +240,18 @@ def build_tools(signals: Dict[str, Any]):
             f"Ticket filed -> department={signals['department']}, "
             f"urgency={signals['urgency_label']!r}, summary={summary!r}"
         )
+
+    return create_support_ticket
+
+
+def _issue_refund_tool(signals: Dict[str, Any]):
+    """Billing-only tool, gated on the classifier's own refund-probability
+    signal: even if the resolver agent decides to call it, the tool
+    refuses unless the classifier's independent read of the message
+    actually supports a refund intent above a safety threshold. This is
+    the "classifier guards resolver" pattern, and it applies identically
+    whether the classifier was Jev or an LLM.
+    """
 
     @tool
     def issue_refund(order_id: str, amount: float) -> str:
@@ -254,20 +267,72 @@ def build_tools(signals: Dict[str, Any]):
             return f"No order found with id {order_id}"
         return f"Refund of ${amount:.2f} issued for {order_id} ({order['item']})."
 
-    return [lookup_order, create_support_ticket, issue_refund]
+    return issue_refund
 
 
-SYSTEM_PROMPT = """You are a customer support agent. A pre-classifier has already
-scored this ticket; treat its numbers as reliable priors, not
-suggestions to re-derive from scratch:
+def _escalate_to_engineering_tool():
+    @tool
+    def escalate_to_engineering(summary: str) -> str:
+        """Escalate a production-impacting bug straight to the engineering on-call."""
+        return f"Escalated to engineering on-call -> {summary!r}"
+
+    return escalate_to_engineering
+
+
+def _send_password_reset_tool():
+    @tool
+    def send_password_reset_link(email: str) -> str:
+        """Send an account password reset link to the customer's email."""
+        return f"Password reset link sent to {email}."
+
+    return send_password_reset_link
+
+
+# Each department gets its own role framing and its own toolset -- a
+# billing agent can issue refunds, a technical agent can escalate to
+# engineering, an account agent can send a password reset, and none of
+# them can do each other's job.
+DEPARTMENT_AGENTS = {
+    "billing": {
+        "role": "You are a billing support specialist. You handle payments, invoices, subscriptions and refunds.",
+        "tools": lambda signals: [_lookup_order_tool(), _create_ticket_tool(signals), _issue_refund_tool(signals)],
+    },
+    "technical": {
+        "role": (
+            "You are a technical support engineer. You handle bugs, errors and product "
+            "issues, and escalate anything production-impacting straight to engineering."
+        ),
+        "tools": lambda signals: [_lookup_order_tool(), _create_ticket_tool(signals), _escalate_to_engineering_tool()],
+    },
+    "account": {
+        "role": "You are an account security specialist. You handle login, password and access issues.",
+        "tools": lambda signals: [_create_ticket_tool(signals), _send_password_reset_tool()],
+    },
+    "other": {
+        "role": "You are a general support agent. You handle anything that doesn't fit a specialized department.",
+        "tools": lambda signals: [_create_ticket_tool(signals)],
+    },
+}
+
+SYSTEM_PROMPT_TEMPLATE = """{role}
+
+A pre-classifier has already scored this ticket; treat its numbers as
+reliable priors, not suggestions to re-derive from scratch:
 
 - department: {department} (confidence {department_confidence:.2f})
 - urgency: {urgency_label} (score {urgency_score:.2f}, confidence {urgency_confidence:.2f})
 - refund intent probability: {refund_probability:.2f}
 
-Resolve the ticket: look up any order mentioned, and either file a
-support ticket or issue a refund as appropriate. Be concise.
+Resolve the ticket using your available tools. Be concise.
 """
+
+
+def build_department_agent(signals: Dict[str, Any], llm: BaseChatModel):
+    """Build the specialized resolver agent for this ticket's classified department."""
+    config = DEPARTMENT_AGENTS.get(signals["department"], DEPARTMENT_AGENTS["other"])
+    tools = config["tools"](signals)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(role=config["role"], **signals)
+    return create_react_agent(model=llm, tools=tools), system_prompt
 
 
 def _sum_usage(messages) -> tuple[int, int]:
@@ -282,11 +347,13 @@ def _sum_usage(messages) -> tuple[int, int]:
 
 
 def _resolve_or_exit(message: str, signals: Dict[str, Any], llm: BaseChatModel) -> Dict[str, Any]:
-    """Auto-resolve from the classifier's signals, or hand off to the resolver agent."""
+    """Auto-resolve from the classifier's signals, or route to the
+    department-specialized resolver agent.
+    """
     if should_early_exit(signals):
         reply = (
             f"Ticket auto-filed -> department={signals['department']}, "
-            f"urgency={signals['urgency_label']!r} (no resolver LLM call needed)."
+            f"urgency={signals['urgency_label']!r} (no resolver agent call needed)."
         )
         return {
             "agent_reply": reply,
@@ -296,14 +363,13 @@ def _resolve_or_exit(message: str, signals: Dict[str, Any], llm: BaseChatModel) 
             "early_exit": True,
         }
 
-    tools = build_tools(signals)
-    agent = create_react_agent(model=llm, tools=tools)
+    agent, system_prompt = build_department_agent(signals, llm)
 
     started = time.monotonic()
     result = agent.invoke(
         {
             "messages": [
-                SystemMessage(content=SYSTEM_PROMPT.format(**signals)),
+                SystemMessage(content=system_prompt),
                 {"role": "user", "content": message},
             ]
         }
@@ -327,7 +393,7 @@ def _resolve_or_exit(message: str, signals: Dict[str, Any], llm: BaseChatModel) 
 
 def handle_ticket_llm_classifier(message: str, llm: BaseChatModel) -> Dict[str, Any]:
     """'Only LLM' workflow: an LLM call classifies the ticket (and can
-    early-exit); otherwise the resolver LLM handles it.
+    early-exit); otherwise the matching department agent handles it.
     """
     signals = llm_triage(llm, message)
     resolution = _resolve_or_exit(message, signals, llm)
@@ -344,7 +410,7 @@ def handle_ticket_llm_classifier(message: str, llm: BaseChatModel) -> Dict[str, 
 
 def handle_ticket_jev_classifier(message: str, jev: TypeSafeClassifier, llm: BaseChatModel) -> Dict[str, Any]:
     """'Jev + LLM' workflow: Jev classifies the ticket (and can
-    early-exit); otherwise the same resolver LLM handles it.
+    early-exit); otherwise the same department agents handle it.
     """
     signals = jev_triage(jev, message)
     resolution = _resolve_or_exit(message, signals, llm)
